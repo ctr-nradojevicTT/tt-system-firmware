@@ -52,6 +52,13 @@
 #define PMBUS_CMD_BYTE_SIZE            1
 #define PMBUS_FLIP_BYTES               0
 
+/* MAX20816 manufacturer-specific I/O configuration register.
+ * Clearing bit 7 selects the analog AIMON output mode.
+ */
+#define MAX20816_MFR_IO_CONFIG          0xCD
+#define MAX20816_AIMON_DIG_MODE_MASK    (1U << 7)
+#define MAX20816_IO_CONFIG_DATA_SIZE    2
+
 /* VR feedback resistors */
 #define GDDR_VDDR_FB1         0.422
 #define GDDR_VDDR_FB2         1.0
@@ -74,6 +81,45 @@ LOG_MODULE_REGISTER(regulator);
 /* The default value is the regulator default */
 static uint8_t vout_cmd_source = VoutCommand;
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
+
+/*
+ * Configure the selected MAX20816 AIMON pin mode.
+ *
+ * Setting digital_mode to true writes 1 to 0xCD_0[7] and selects the digital
+ * indicator output. Setting it to false writes 0 and selects analog AIMON.
+ *
+ * This helper only reports the I2C result. The caller intentionally treats
+ * failure as non-fatal so that this diagnostic sequence cannot block regulator
+ * or board initialization.
+ */
+static uint32_t max20816_set_aimon_mode(uint32_t slave_addr, bool digital_mode)
+{
+	const uint8_t data[MAX20816_IO_CONFIG_DATA_SIZE] = {
+		digital_mode ? MAX20816_AIMON_DIG_MODE_MASK : 0,
+		0,
+	};
+	const uint8_t mask[MAX20816_IO_CONFIG_DATA_SIZE] = {
+		MAX20816_AIMON_DIG_MODE_MASK,
+		0,
+	};
+
+	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+
+	return I2CRMWV(PMBUS_MST_ID, MAX20816_MFR_IO_CONFIG, PMBUS_CMD_BYTE_SIZE, data, mask,
+		       MAX20816_IO_CONFIG_DATA_SIZE);
+}
+
+static uint32_t max20816_read_io_config(uint32_t slave_addr, uint16_t *value)
+{
+	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+
+	return I2CReadBytes(PMBUS_MST_ID,
+			    MAX20816_MFR_IO_CONFIG,
+			    PMBUS_CMD_BYTE_SIZE,
+			    (uint8_t *)value,
+			    MAX20816_IO_CONFIG_DATA_SIZE,
+			    PMBUS_FLIP_BYTES);
+}
 
 static float ConvertLinear11ToFloat(uint16_t value)
 {
@@ -323,6 +369,69 @@ uint32_t RegulatorInit(PcbType board_type)
 			}
 		}
 	}
+
+#if 0
+	/*
+	 * P150 VCORE uses the MAX20816 at I2C address 0x64.
+	 *
+	 * Diagnostic sequence:
+	 * 1. Set 0xCD_0[7] to 1 and read it back.
+	 * 2. Clear 0xCD_0[7] to 0 and read it back.
+	 *
+	 * The final state is analog AIMON mode. All failures are logged but are not
+	 * added to aggregate_i2c_errors, so this sequence cannot block board
+	 * initialization.
+	 */
+	if (board_type == PcbTypeP150) {
+		uint32_t aimon_addr = P0V8_VCORE_ADDR;
+		uint32_t aimon_i2c_error;
+		uint32_t readback_i2c_error;
+		uint16_t io_config = 0;
+
+		aimon_i2c_error = max20816_set_aimon_mode(aimon_addr, true);
+
+		if (aimon_i2c_error) {
+			LOG_WRN("MAX20816 (%#x) AIMON_DIG=1 write failed: %#x",
+				aimon_addr, aimon_i2c_error);
+		} else {
+			readback_i2c_error = max20816_read_io_config(aimon_addr, &io_config);
+
+			if (readback_i2c_error) {
+				LOG_WRN("MAX20816 (%#x) AIMON_DIG=1 readback failed: %#x",
+					aimon_addr, readback_i2c_error);
+			} else {
+				LOG_INF("MAX20816 (%#x) register 0xCD after AIMON_DIG=1: "
+					"0x%04x, AIMON_DIG=%u",
+					aimon_addr,
+					io_config,
+					(io_config & MAX20816_AIMON_DIG_MODE_MASK) ? 1U : 0U);
+			}
+		}
+
+#else
+		io_config = 0;
+		aimon_i2c_error = max20816_set_aimon_mode(aimon_addr, false);
+
+		if (aimon_i2c_error) {
+			LOG_WRN("MAX20816 (%#x) AIMON_DIG=0 write failed: %#x",
+				aimon_addr, aimon_i2c_error);
+		} else {
+			readback_i2c_error = max20816_read_io_config(aimon_addr, &io_config);
+
+			if (readback_i2c_error) {
+				LOG_WRN("MAX20816 (%#x) AIMON_DIG=0 readback failed: %#x",
+					aimon_addr, readback_i2c_error);
+			} else {
+				LOG_INF("MAX20816 (%#x) register 0xCD after AIMON_DIG=0: "
+					"0x%04x, AIMON_DIG=%u",
+					aimon_addr,
+					io_config,
+					(io_config & MAX20816_AIMON_DIG_MODE_MASK) ? 1U : 0U);
+			}
+		}
+#endif
+	}
+
 	return aggregate_i2c_errors;
 }
 
